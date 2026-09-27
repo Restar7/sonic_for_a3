@@ -89,7 +89,8 @@ list(APPEND PROJECT_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/a3_deploy/a3_manual_control.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/a3_deploy/a3_motion_library.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/a3_deploy/a3_encoder_decoder_runtime.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/a3_deploy/a3_zmq_smpl_source.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/a3_deploy/a3_zmq_smpl_source.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/a3_deploy/a3_reference_stream.cpp)
 list(REMOVE_DUPLICATES PROJECT_SRCS)
 list(REMOVE_ITEM PROJECT_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/g1_deploy_onnx_ref.cpp)
 # a3_deploy/main.cpp is the entry point for the a3_deploy_onnx_ref executable
@@ -987,6 +988,11 @@ list(APPEND TEST_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/test_a3_manual_control.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/test_a3_encoder_obs_builder.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/test_packed_motion_decoder.cpp)
+# The standalone reference-stream test provides its own main() and is built and
+# run separately (tools/run_cpp_reference_test.sh in a3_teleop_bridge) so it does
+# not need ROS/ONNX Runtime.
+list(REMOVE_ITEM TEST_SRCS
+  ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/test_a3_reference_stream_standalone.cpp)
 list(REMOVE_DUPLICATES TEST_SRCS)
 
 add_executable(run_tests ${TEST_SRCS})
