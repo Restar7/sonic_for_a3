@@ -36,6 +36,11 @@ import msgpack
 import numpy as np
 
 PROTOCOL_VERSION = "A3_REFERENCE_V1"
+#: ``joint_pos_rad`` / ``joint_vel_rad_s`` are published in the order this encoder
+#: consumes (URDF/IsaacLab ``dof_il`` order).  The CSV/MJCF policy order is a
+#: different permutation of the same joints -- mixing them up silently destroys
+#: the policy input.
+JOINT_ORDER_TAG = "a3_il_v1"
 MAGIC = b"A3R1"
 _MAGIC_STRUCT = struct.Struct("<4sI")
 ARRAY_ORDER = ("root_pos_m", "root_quat_wxyz", "joint_pos_rad", "joint_vel_rad_s")
@@ -92,6 +97,12 @@ def decode_reference_packet(packet: bytes) -> ReferenceWindow:
         raise ValueError(f"protocol version mismatch: {header.get('version')!r}")
     if header.get("endian", "le") != "le":
         raise ValueError("only little-endian payloads are supported")
+    joint_order = header.get("joint_order")
+    if joint_order != JOINT_ORDER_TAG:
+        raise ValueError(
+            f"joint order mismatch: packet says {joint_order!r}, this encoder needs "
+            f"{JOINT_ORDER_TAG!r}"
+        )
     shapes = header["shapes"]
     dtype = np.dtype(header.get("dtype", "<f4"))
     payload = np.frombuffer(payload_bytes, dtype=dtype)
