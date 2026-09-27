@@ -140,6 +140,8 @@ class StreamingStats:
     received: int = 0
     rejected: int = 0
     dropped: int = 0
+    jumps: int = 0
+    max_jump_ms: float = 0.0
     last_seq: int | None = None
     last_reason: str = ""
     latencies_ms: list[float] = field(default_factory=list)
@@ -150,6 +152,8 @@ class StreamingStats:
             "received": self.received,
             "rejected": self.rejected,
             "dropped": self.dropped,
+            "jumps": self.jumps,
+            "max_jump_ms": self.max_jump_ms,
             "last_seq": self.last_seq,
             "last_reason": self.last_reason,
             "latency_p50_ms": float(np.percentile(lat, 50)) if lat.size else None,
@@ -218,8 +222,17 @@ class StreamingReferenceProvider:
         self.stats.received += 1
         if self.stats.last_seq is not None and window.seq > self.stats.last_seq + 1:
             self.stats.dropped += window.seq - self.stats.last_seq - 1
+        if self.stats.last_seq is not None and window.seq > self.stats.last_seq + 1:
+            self.stats.dropped += window.seq - self.stats.last_seq - 1
         self.stats.last_seq = window.seq
         self.stats.latencies_ms.append(window.source_age_ms)
+        # local age of the window relative to the previous one we handed out; a
+        # large value means the consumer stalled and the reference jumped
+        if self.last_window is not None:
+            delta_ms = (window.timestamp_ns - self.last_window.timestamp_ns) / 1e6
+            if delta_ms > 60.0:
+                self.stats.jumps += 1
+                self.stats.max_jump_ms = max(self.stats.max_jump_ms, delta_ms)
         self.last_window = window
         self.last_receive_time = window.timestamp_ns / 1e9 if window.timestamp_ns else None
         return window
@@ -268,3 +281,6 @@ class StreamingReferenceProvider:
             self.socket.close(linger=0)
         except Exception:
             pass
+
+    def stats_dict(self) -> dict:
+        return self.stats.as_dict()

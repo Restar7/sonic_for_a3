@@ -4133,6 +4133,11 @@ class LoopSimRunner:
                 break
             policy_step += 1
 
+        if hasattr(self.reference_provider, "stats_dict"):
+            stats = self.reference_provider.stats_dict()
+            print(f"[reference-stream] {stats}", flush=True)
+            self.reference_provider.close()
+
     def _ref_frame_for_step(self, policy_step: int) -> int | None:
         del policy_step
         return reference_frame_index(self.reference, self.current_ref_frame, DEFAULT_REFERENCE_ON_END)
