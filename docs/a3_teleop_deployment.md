@@ -126,7 +126,13 @@ Run the live stack (PICO → SMPL → online UMR → predictor → publisher):
 ```bash
 # terminal 1: PICO sender (XRoboToolkit PC service must be connected to the headset)
 cd ~/a3_teleop_ws/sonic_for_a3
-.venv_sim/bin/python gear_sonic/scripts/pico_pose_zmq_minimal.py --port 5556
+.venv_sim/bin/python gear_sonic/scripts/pico_pose_zmq_minimal.py \
+    --port 5556 --target_fps 50 --start_unpaused
+# NOTE: the sender starts PAUSED.  Without --start_unpaused (or pressing the
+# controller's A button) it publishes nothing, and the bridge silently receives
+# no frames.  Wait for "Stream state: RUNNING" and a growing `sent` counter.
+# SDK build (x86: setup_ubuntu.sh / Orin: setup_orin.sh) is described in
+# a3_teleop_bridge/docs/pico_setup.md.
 
 # terminal 2: reference generation, published for the A3 / MuJoCo consumer
 cd ~/a3_teleop_ws/a3_teleop_bridge && source scripts/env_orin.sh
