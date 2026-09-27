@@ -142,6 +142,8 @@ class StreamingStats:
     dropped: int = 0
     jumps: int = 0
     max_jump_ms: float = 0.0
+    interpolated: int = 0
+    max_gap_ms: float = 0.0
     last_seq: int | None = None
     last_reason: str = ""
     latencies_ms: list[float] = field(default_factory=list)
@@ -154,6 +156,8 @@ class StreamingStats:
             "dropped": self.dropped,
             "jumps": self.jumps,
             "max_jump_ms": self.max_jump_ms,
+            "interpolated": self.interpolated,
+            "max_gap_ms": self.max_gap_ms,
             "last_seq": self.last_seq,
             "last_reason": self.last_reason,
             "latency_p50_ms": float(np.percentile(lat, 50)) if lat.size else None,
@@ -175,6 +179,7 @@ class StreamingReferenceProvider:
         recv_timeout_ms: int = 50,
         stale_after_ms: float = 250.0,
         verbose: bool = False,
+        slot_ms: float = 20.0,
     ) -> None:
         import zmq  # imported lazily so CSV-only runs keep working without pyzmq
 
@@ -189,15 +194,23 @@ class StreamingReferenceProvider:
         self.socket.connect(endpoint)
         self.stale_after_ms = float(stale_after_ms)
         self.verbose = verbose
+        #: encoder reference slot spacing (A3-fast contract: 10 slots x 20 ms)
+        self.slot_ms = float(slot_ms)
         self.stats = StreamingStats()
         self.last_window: ReferenceWindow | None = None
         self.last_receive_time: float | None = None
         self.hold_window: ReferenceWindow | None = None
+        # Window handed to the encoder, plus the newest one received.  They differ
+        # while the consumer catches up (see get_window).
+        self._current: ReferenceWindow | None = None
+        self._pending: ReferenceWindow | None = None
 
     # ------------------------------------------------------------------
     def reset(self) -> None:
         self.last_window = None
         self.hold_window = None
+        self._current = None
+        self._pending = None
 
     def poll(self) -> ReferenceWindow | None:
         """Drain the socket and decode the newest packet (latest-only)."""
@@ -250,31 +263,91 @@ class StreamingReferenceProvider:
         """Return the newest complete window (signature matches the CSV path)."""
         del ref_frame, frame_skip, history_frames, valid_future_frames, zero_pad_invalid_frames, on_end
         fresh = self.poll()
-        if fresh is not None:
-            if fresh.valid:
-                self.hold_window = fresh
-                return fresh
+        if fresh is not None and fresh.valid:
+            self._pending = fresh
+            self.hold_window = fresh
+        elif fresh is not None and not fresh.valid:
             # an explicitly invalid frame (HOLD / SAFE_STOP) is forwarded as-is
+            self._pending = None
+            self._current = None
             return fresh
-        if self.hold_window is not None:
-            held = ReferenceWindow(
-                anchor_quat_wxyz=self.hold_window.anchor_quat_wxyz.copy(),
-                dof_il=self.hold_window.dof_il.copy(),
-                dof_vel_il=np.zeros_like(self.hold_window.dof_vel_il),
-                valid=False,
-                source_age_ms=self.hold_window.source_age_ms,
-                seq=self.hold_window.seq,
-                timestamp_ns=self.hold_window.timestamp_ns,
-                state="HOLD",
-                root_pos_m=None
-                if self.hold_window.root_pos_m is None
-                else self.hold_window.root_pos_m.copy(),
-                note="no packet available; holding the last valid window",
-            )
-            return held
-        raise RuntimeError(
-            "no A3_REFERENCE_V1 packet received yet; is the bridge publisher running?"
+
+        if self._pending is None:
+            if self.hold_window is None:
+                raise RuntimeError(
+                    "no A3_REFERENCE_V1 packet received yet; is the bridge publisher running?"
+                )
+            return self._blend_hold()
+
+        if self._current is None:
+            self._current = self._pending
+            return self._current
+
+        gap_ms = (self._pending.timestamp_ns - self._current.timestamp_ns) / 1e6
+        slot_ms = self.slot_ms
+        if gap_ms <= 0.0:
+            # the publisher restarted or the clocks skewed: adopt the newest window
+            self._current = self._pending
+            return self._current
+        alpha = 1.0 if gap_ms <= slot_ms else min(1.0, slot_ms / gap_ms)
+        if alpha < 1.0:
+            self.stats.interpolated += 1
+            self.stats.max_gap_ms = max(self.stats.max_gap_ms, gap_ms)
+        self._current = self._blend(self._current, self._pending, alpha)
+        return self._current
+
+    @staticmethod
+    def _blend(a: ReferenceWindow, b: ReferenceWindow, alpha: float) -> ReferenceWindow:
+        """Blend two windows; alpha=1 reproduces ``b`` exactly.
+
+        Nlerp with a hemisphere fix is used for the root quaternion: the gaps
+        smoothed here are a few 20 ms slots, far below the range where slerp and
+        nlerp differ meaningfully, and it keeps the per-tick cost flat.
+        """
+        if alpha >= 1.0:
+            return b
+        joint_pos = (1.0 - alpha) * a.dof_il + alpha * b.dof_il
+        joint_vel = (1.0 - alpha) * a.dof_vel_il + alpha * b.dof_vel_il
+        quat_a = a.anchor_quat_wxyz
+        quat_b = b.anchor_quat_wxyz.copy()
+        flip = np.sum(quat_a * quat_b, axis=1) < 0.0
+        quat_b[flip] *= -1.0
+        quat = (1.0 - alpha) * quat_a + alpha * quat_b
+        norms = np.linalg.norm(quat, axis=1, keepdims=True)
+        quat = quat / np.where(norms > 1e-9, norms, 1.0)
+        root_pos = None
+        if a.root_pos_m is not None and b.root_pos_m is not None:
+            root_pos = (1.0 - alpha) * a.root_pos_m + alpha * b.root_pos_m
+        return ReferenceWindow(
+            anchor_quat_wxyz=quat,
+            dof_il=joint_pos,
+            dof_vel_il=joint_vel,
+            valid=b.valid,
+            source_age_ms=b.source_age_ms,
+            seq=b.seq,
+            timestamp_ns=int(round((1.0 - alpha) * a.timestamp_ns + alpha * b.timestamp_ns)),
+            state=b.state,
+            root_pos_m=root_pos,
+            note="interpolated",
         )
+
+    def _blend_hold(self) -> ReferenceWindow:
+        """No packet available: freeze the last valid window, velocities zeroed."""
+        base = self.hold_window
+        frozen = ReferenceWindow(
+            anchor_quat_wxyz=base.anchor_quat_wxyz.copy(),
+            dof_il=base.dof_il.copy(),
+            dof_vel_il=np.zeros_like(base.dof_vel_il),
+            valid=False,
+            source_age_ms=base.source_age_ms,
+            seq=base.seq,
+            timestamp_ns=base.timestamp_ns,
+            state="HOLD",
+            root_pos_m=None if base.root_pos_m is None else base.root_pos_m.copy(),
+            note="no packet available; holding the last valid window",
+        )
+        self._current = None
+        return frozen
 
     def close(self) -> None:
         try:
