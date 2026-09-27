@@ -268,6 +268,7 @@ class SimConfig:
     action_delay_ms: float = 0.0
     reference_source: str = "csv"
     reference_endpoint: str = "tcp://127.0.0.1:5560"
+    realtime: bool = False
 
 
 # =============================================================================
@@ -2304,6 +2305,7 @@ def build_sim_config(args: argparse.Namespace) -> SimConfig:
         csv_frame_stride=int(args.csv_frame_stride),
         reference_source=str(args.reference_source),
         reference_endpoint=str(args.reference_endpoint),
+        realtime=bool(args.realtime),
     )
     if config.max_policy_steps is not None and config.max_policy_steps <= 0:
         raise SystemExit("--max-policy-steps must be positive")
@@ -4122,7 +4124,10 @@ class LoopSimRunner:
             if not self.config.batch_once and not self._sync_viewer(ref_frame):
                 break
             self._render_progress()
-            if not self.config.batch_once:
+            if not self.config.batch_once or self.config.realtime:
+                # --realtime keeps the policy clock aligned with the wall clock even
+                # in batch mode, which is required when the reference arrives from a
+                # live stream (the publisher advances in wall-clock time).
                 self._pace_after_step(sim_time_before)
             if not self._advance_playlist_if_needed(policy_step):
                 break
@@ -4522,6 +4527,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=4,
         help="Number of prepared reference clips to keep while browsing a directory.",
+    )
+    parser.add_argument(
+        "--realtime",
+        action="store_true",
+        help=(
+            "Pace the policy loop against the wall clock even with --batch-once. "
+            "Required when the reference comes from a live stream "
+            "(--reference-source stream) so reference time and policy time agree."
+        ),
     )
     parser.add_argument(
         "--reference-source",
