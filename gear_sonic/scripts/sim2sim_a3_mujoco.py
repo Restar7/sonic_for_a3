@@ -67,6 +67,10 @@ from gear_sonic.utils.a3_motor_params import (
     ARMATURE_PFP_78_58,
     ARMATURE_PFP_93_65,
 )
+from gear_sonic.utils.reference_provider import (
+    ReferenceWindow,
+    StreamingReferenceProvider,
+)
 from gear_sonic.utils.terrain_profile import patch_mjcf_with_terrain_profile
 
 
@@ -262,6 +266,8 @@ class SimConfig:
     csv_source_fps: float
     csv_frame_stride: int
     action_delay_ms: float = 0.0
+    reference_source: str = "csv"
+    reference_endpoint: str = "tcp://127.0.0.1:5560"
 
 
 # =============================================================================
@@ -1296,6 +1302,65 @@ def flatten_history(history: dict[str, deque[np.ndarray]]) -> np.ndarray:
     ).astype(np.float32)
 
 
+class CsvReferenceProvider:
+    """Adapter that exposes a :class:`MotionReference` as a ReferenceProvider.
+
+    It deliberately calls the module-level index helpers instead of
+    re-implementing the slicing, so a CSV run through this provider produces
+    exactly the same encoder input as the historical inline code path.
+    """
+
+    def __init__(self, reference: MotionReference) -> None:
+        self.set_reference(reference)
+
+    def set_reference(self, reference: MotionReference) -> None:
+        self.reference = reference
+
+    def reset(self) -> None:
+        return None
+
+    def get_window(
+        self,
+        ref_frame: int,
+        frame_skip: int,
+        history_frames: int = 0,
+        valid_future_frames: int | None = None,
+        zero_pad_invalid_frames: bool = False,
+        on_end: str = "hold_last",  # same value as DEFAULT_REFERENCE_ON_END (defined below)
+    ) -> ReferenceWindow:
+        indices = future_reference_indices(
+            self.reference,
+            ref_frame,
+            on_end,
+            frame_skip,
+            history_frames,
+            valid_future_frames,
+        )
+        return ReferenceWindow(
+            anchor_quat_wxyz=self.reference.anchor_quat_wxyz[indices],
+            dof_il=self.reference.dof_il[indices],
+            dof_vel_il=self.reference.dof_vel_il[indices],
+            valid=True,
+        )
+
+
+def build_reference_provider(
+    source: str,
+    reference: MotionReference | None,
+    endpoint: str,
+    stale_after_ms: float = 250.0,
+    verbose: bool = False,
+):
+    """Factory used by the CLI: ``csv`` (default) or ``stream``."""
+    if source == "stream":
+        return StreamingReferenceProvider(
+            endpoint=endpoint, stale_after_ms=stale_after_ms, verbose=verbose
+        )
+    if reference is None:
+        raise ValueError("the csv reference source needs a motion reference")
+    return CsvReferenceProvider(reference)
+
+
 def build_encoder_input(
     reference: MotionReference,
     ref_frame: int,
@@ -1305,6 +1370,7 @@ def build_encoder_input(
     history_frames: int = 0,
     valid_future_frames: int | None = None,
     zero_pad_invalid_frames: bool = False,
+    window_provider=None,
 ) -> np.ndarray:
     command_flat, ori_6d = build_tokenizer_terms(
         reference,
@@ -1315,6 +1381,7 @@ def build_encoder_input(
         history_frames,
         valid_future_frames,
         zero_pad_invalid_frames,
+        window_provider,
     )
     # Match command_multi_future(non_flatten=True) exactly:
     # command = cat([all future q positions, all future q velocities]), then reshape(10, 58).
@@ -1371,18 +1438,47 @@ def build_tokenizer_terms(
     history_frames: int = 0,
     valid_future_frames: int | None = None,
     zero_pad_invalid_frames: bool = False,
+    window_provider=None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    indices = future_reference_indices(
-        reference,
-        ref_frame,
-        on_end,
-        frame_skip,
-        history_frames,
-        valid_future_frames,
-    )
-    ori_6d = root_ori_diff_6d(robot_anchor_quat_wxyz, reference.anchor_quat_wxyz[indices])
-    joint_pos = reference.dof_il[indices].copy()
-    joint_vel = reference.dof_vel_il[indices].copy()
+    """Build the encoder tokenizer terms.
+
+    ``window_provider`` (plan section 39) lets the reference window come from
+    somewhere other than the CSV playlist.  With ``None`` -- the default and the
+    only path the CSV workflow uses -- the code below is unchanged.  With a
+    provider (``CsvReferenceProvider`` / ``StreamingReferenceProvider``) only the
+    *source* of ``anchor_quat / joint_pos / joint_vel`` changes; the observation
+    construction (6D orientation diff, ordering, padding) stays exactly here.
+    """
+    if window_provider is None:
+        indices = future_reference_indices(
+            reference,
+            ref_frame,
+            on_end,
+            frame_skip,
+            history_frames,
+            valid_future_frames,
+        )
+        ref_anchor_quat = reference.anchor_quat_wxyz[indices]
+        joint_pos = reference.dof_il[indices].copy()
+        joint_vel = reference.dof_vel_il[indices].copy()
+    else:
+        window = window_provider.get_window(
+            ref_frame,
+            frame_skip,
+            history_frames,
+            valid_future_frames,
+            zero_pad_invalid_frames,
+            on_end,
+        )
+        ref_anchor_quat = window.anchor_quat_wxyz
+        joint_pos = np.asarray(window.dof_il, dtype=np.float64).copy()
+        joint_vel = np.asarray(window.dof_vel_il, dtype=np.float64).copy()
+        if joint_pos.shape != (NUM_FUTURE_FRAMES, NUM_POLICY_DOFS):
+            raise RuntimeError(
+                f"reference provider returned joint_pos {joint_pos.shape}, "
+                f"expected {(NUM_FUTURE_FRAMES, NUM_POLICY_DOFS)}"
+            )
+    ori_6d = root_ori_diff_6d(robot_anchor_quat_wxyz, ref_anchor_quat)
     if zero_pad_invalid_frames:
         if valid_future_frames is None:
             raise ValueError("zero_pad_invalid_frames requires valid_future_frames")
@@ -2206,6 +2302,8 @@ def build_sim_config(args: argparse.Namespace) -> SimConfig:
         anchor_body=str(args.anchor_body),
         csv_source_fps=float(args.csv_source_fps),
         csv_frame_stride=int(args.csv_frame_stride),
+        reference_source=str(args.reference_source),
+        reference_endpoint=str(args.reference_endpoint),
     )
     if config.max_policy_steps is not None and config.max_policy_steps <= 0:
         raise SystemExit("--max-policy-steps must be positive")
@@ -3713,6 +3811,14 @@ class LoopSimRunner:
         self.motion_paths = motion_paths
         self.reference_cache = reference_cache
         self.reference = initial_reference
+        # Reference source (plan section 39): the CSV playlist stays the default and
+        # keeps using the identical slicing code; 'stream' swaps in a
+        # StreamingReferenceProvider fed by A3_REFERENCE_V1 over ZMQ.
+        self.reference_provider = build_reference_provider(
+            getattr(config, "reference_source", "csv"),
+            initial_reference,
+            getattr(config, "reference_endpoint", "tcp://127.0.0.1:5560"),
+        )
         self.video_references = video_references
         self.solver = solver
         self.policy = policy
@@ -4059,6 +4165,7 @@ class LoopSimRunner:
             self.config.future_history_frames,
             self.config.future_valid_frames,
             self.config.future_zero_pad,
+            self.reference_provider,
         )
         actor_obs = flatten_history(self.history)
         raw_action_il = self.policy.act(encoder_input, actor_obs, self.device).astype(np.float64)
@@ -4415,6 +4522,22 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=4,
         help="Number of prepared reference clips to keep while browsing a directory.",
+    )
+    parser.add_argument(
+        "--reference-source",
+        choices=("csv", "stream"),
+        default="csv",
+        help=(
+            "Where the encoder reference window comes from. 'csv' (default) keeps the "
+            "historical flat-CSV playback; 'stream' subscribes to A3_REFERENCE_V1 "
+            "windows published by the a3_teleop_bridge (the CSV playlist is then only "
+            "used for the ghost/metrics, or omitted entirely)."
+        ),
+    )
+    parser.add_argument(
+        "--reference-endpoint",
+        default="tcp://127.0.0.1:5560",
+        help="ZMQ endpoint of the A3_REFERENCE_V1 publisher (only with --reference-source stream).",
     )
     parser.add_argument(
         "--csv-source-fps",
