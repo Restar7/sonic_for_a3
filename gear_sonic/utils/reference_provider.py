@@ -33,6 +33,8 @@ from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 import msgpack
+import time
+
 import numpy as np
 
 PROTOCOL_VERSION = "A3_REFERENCE_V1"
@@ -180,6 +182,8 @@ class StreamingReferenceProvider:
         stale_after_ms: float = 250.0,
         verbose: bool = False,
         slot_ms: float = 20.0,
+        startup_window: "ReferenceWindow | None" = None,
+        startup_wait_s: float = 30.0,
     ) -> None:
         import zmq  # imported lazily so CSV-only runs keep working without pyzmq
 
@@ -193,6 +197,12 @@ class StreamingReferenceProvider:
         self.socket.setsockopt(zmq.SUBSCRIBE, b"")
         self.socket.connect(endpoint)
         self.stale_after_ms = float(stale_after_ms)
+        # Standing reference used until the first real window arrives; None keeps
+        # the old behaviour (abort immediately when nothing was ever received).
+        self.startup_window = startup_window
+        self.startup_wait_s = float(startup_wait_s)
+        self._created_monotonic = time.monotonic()
+        self._startup_warned = False
         self.verbose = verbose
         #: encoder reference slot spacing (A3-fast contract: 10 slots x 20 ms)
         self.slot_ms = float(slot_ms)
@@ -274,6 +284,21 @@ class StreamingReferenceProvider:
 
         if self._pending is None:
             if self.hold_window is None:
+                # Startup: the bridge needs ~15 s to assemble its online UMR session,
+                # so hold a standing reference for a bounded time instead of aborting
+                # the policy loop (the A3 runtime does the same: it feeds a default
+                # standing prefix while TELEOP has no usable window yet).
+                elapsed_s = time.monotonic() - self._created_monotonic
+                if self.startup_window is not None and elapsed_s < self.startup_wait_s:
+                    if not self._startup_warned:
+                        self._startup_warned = True
+                        print(
+                            "[reference-stream] no A3_REFERENCE_V1 packet yet; holding the "
+                            f"startup pose for up to {self.startup_wait_s:.0f} s "
+                            "(is the PICO sender RUNNING and the bridge publishing?)",
+                            flush=True,
+                        )
+                    return self._startup_hold()
                 raise RuntimeError(
                     "no A3_REFERENCE_V1 packet received yet; is the bridge publisher running?"
                 )
@@ -329,6 +354,22 @@ class StreamingReferenceProvider:
             state=b.state,
             root_pos_m=root_pos,
             note="interpolated",
+        )
+
+    def _startup_hold(self) -> ReferenceWindow:
+        """Standing placeholder used until the first real window arrives."""
+        base = self.startup_window
+        return ReferenceWindow(
+            anchor_quat_wxyz=base.anchor_quat_wxyz.copy(),
+            dof_il=base.dof_il.copy(),
+            dof_vel_il=np.zeros_like(base.dof_vel_il),
+            valid=True,
+            source_age_ms=0.0,
+            seq=0,
+            timestamp_ns=0,
+            state="CALIBRATION",
+            root_pos_m=None if base.root_pos_m is None else base.root_pos_m.copy(),
+            note="startup_stand",
         )
 
     def _blend_hold(self) -> ReferenceWindow:

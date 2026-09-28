@@ -267,6 +267,7 @@ class SimConfig:
     csv_frame_stride: int
     action_delay_ms: float = 0.0
     reference_source: str = "csv"
+    reference_startup_wait_s: float = 30.0
     reference_endpoint: str = "tcp://127.0.0.1:5560"
     realtime: bool = False
 
@@ -1351,11 +1352,35 @@ def build_reference_provider(
     endpoint: str,
     stale_after_ms: float = 250.0,
     verbose: bool = False,
+    startup_wait_s: float = 30.0,
 ):
-    """Factory used by the CLI: ``csv`` (default) or ``stream``."""
+    """Factory used by the CLI: ``csv`` (default) or ``stream``.
+
+    For ``stream`` the first frame of the motion reference becomes the standing
+    placeholder used until the first A3_REFERENCE_V1 packet arrives: a live PICO
+    session needs the bridge's ~15 s online-UMR assembly before it can publish,
+    and the policy loop must keep stepping (standing still) until then.
+    """
     if source == "stream":
+        startup_window = None
+        if reference is not None:
+            # The encoder consumes NUM_FUTURE_FRAMES slots, so the placeholder has to
+            # be tiled to that length (a single frame would fail the shape check).
+            frames = int(NUM_FUTURE_FRAMES)
+            quat = np.asarray(reference.anchor_quat_wxyz[:1]).copy()
+            dof = np.asarray(reference.dof_il[:1]).copy()
+            startup_window = ReferenceWindow(
+                anchor_quat_wxyz=np.repeat(quat, frames, axis=0),
+                dof_il=np.repeat(dof, frames, axis=0),
+                dof_vel_il=np.zeros((frames, dof.shape[-1])),
+                valid=True,
+            )
         return StreamingReferenceProvider(
-            endpoint=endpoint, stale_after_ms=stale_after_ms, verbose=verbose
+            endpoint=endpoint,
+            stale_after_ms=stale_after_ms,
+            verbose=verbose,
+            startup_window=startup_window,
+            startup_wait_s=startup_wait_s,
         )
     if reference is None:
         raise ValueError("the csv reference source needs a motion reference")
@@ -2304,6 +2329,7 @@ def build_sim_config(args: argparse.Namespace) -> SimConfig:
         csv_source_fps=float(args.csv_source_fps),
         csv_frame_stride=int(args.csv_frame_stride),
         reference_source=str(args.reference_source),
+        reference_startup_wait_s=float(args.reference_startup_wait_s),
         reference_endpoint=str(args.reference_endpoint),
         realtime=bool(args.realtime),
     )
@@ -3820,6 +3846,7 @@ class LoopSimRunner:
             getattr(config, "reference_source", "csv"),
             initial_reference,
             getattr(config, "reference_endpoint", "tcp://127.0.0.1:5560"),
+            startup_wait_s=getattr(config, "reference_startup_wait_s", 30.0),
         )
         self.video_references = video_references
         self.solver = solver
@@ -4540,6 +4567,16 @@ def parse_args() -> argparse.Namespace:
             "Pace the policy loop against the wall clock even with --batch-once. "
             "Required when the reference comes from a live stream "
             "(--reference-source stream) so reference time and policy time agree."
+        ),
+    )
+    parser.add_argument(
+        "--reference-startup-wait-s",
+        type=float,
+        default=30.0,
+        help=(
+            "With --reference-source stream: how long the policy may hold the motion's "
+            "first frame while waiting for the first A3_REFERENCE_V1 window (a live PICO "
+            "session needs the bridge's ~15 s online-UMR assembly). 0 aborts immediately."
         ),
     )
     parser.add_argument(
