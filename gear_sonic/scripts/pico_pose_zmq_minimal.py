@@ -259,6 +259,38 @@ def _compute_local_smpl_from_xrt(
     return smpl_pose, smpl_joints_local, body_quat_w
 
 
+def _compute_root_translation(
+    body_poses_np: np.ndarray,
+    anchor: np.ndarray | None,
+    standing_pelvis_m: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pelvis translation for the packet, anchored to where the operator started.
+
+    ``body_poses_np[:, :3]`` is the XR joint position in the headset's own
+    tracking frame: an arbitrary origin, Y-up, and only meaningful *relative* to
+    the start of the session.  The bridge wants a Z-up root at a plausible
+    standing height (its recordings carry z = 0.975), so:
+
+      * rotate Y-up -> Z-up the same way the quaternions are rotated,
+      * anchor horizontally on the first frame, so "where the headset booted"
+        never becomes "where the robot must stand",
+      * put the pelvis at ``standing_pelvis_m`` and keep only the *relative*
+        vertical motion on top of it.
+
+    Without this the operator's translation never leaves the headset and the
+    robot can only step in place ("I take big steps, it takes small ones").
+    """
+    pelvis = np.asarray(body_poses_np[0, :3], dtype=np.float64)
+    zup = np.array([pelvis[0], -pelvis[2], pelvis[1]], dtype=np.float64)
+    if anchor is None:
+        anchor = zup
+    relative = zup - anchor
+    translation = np.array(
+        [relative[0], relative[1], float(standing_pelvis_m) + relative[2]], dtype=np.float32
+    )
+    return translation, anchor
+
+
 def _is_safe_pose_sample(
     smpl_pose: np.ndarray,
     smpl_joints: np.ndarray,
@@ -372,6 +404,8 @@ def run_sender(
     max_abs_smpl_joint: float,
     max_frame_jump: float,
     start_paused: bool,
+    publish_root_translation: bool = True,
+    standing_pelvis_m: float = 0.975,
 ) -> None:
     if xrt is None:
         raise ImportError("xrobotoolkit_sdk is not installed or cannot be loaded")
@@ -391,12 +425,14 @@ def run_sender(
         time.sleep(1.0)
 
     frame_buffer = defaultdict(lambda: deque(maxlen=num_frames_to_send))
+    frame_buffer["root_translation"] = deque(maxlen=num_frames_to_send)
     last_stamp_ns = None
     last_report = time.time()
     sent = 0
     skipped = 0
     step = 0
     prev_smpl_joints = None
+    root_anchor = None
     last_skip_report = 0.0
     frame_time = 1.0 / max(1, target_fps)
     paused = bool(start_paused)
@@ -424,12 +460,19 @@ def run_sender(
                 prev_smpl_joints = None
                 state = "PAUSED" if paused else "RUNNING"
                 print(f"[minimal] A pressed: Stream state -> {state}")
+                if state == "RUNNING":
+                    root_anchor = None      # re-anchor where the operator stands now
             prev_a_pressed = a_pressed
 
             body_poses_np = np.asarray(xrt.get_body_joints_pose(), dtype=np.float32)
             smpl_pose, smpl_joints, body_quat_w = _compute_local_smpl_from_xrt(
                 body_poses_np, human_fk
             )
+            root_translation, root_anchor = _compute_root_translation(
+                body_poses_np, root_anchor if publish_root_translation else None, standing_pelvis_m
+            )
+            if not publish_root_translation:
+                root_translation = None
             joint_pos = _compute_wrist_joint_pos(smpl_pose)
             ok, reason = _is_safe_pose_sample(
                 smpl_pose,
@@ -443,6 +486,7 @@ def run_sender(
             if not ok:
                 frame_buffer.clear()
                 prev_smpl_joints = None
+                root_anchor = None          # re-anchor where the operator stands next
                 skipped += 1
                 now = time.time()
                 if now - last_skip_report >= 1.0:
@@ -455,6 +499,8 @@ def run_sender(
             frame_buffer["smpl_joints"].append(smpl_joints)
             frame_buffer["body_quat_w"].append(body_quat_w)
             frame_buffer["joint_pos"].append(joint_pos)
+            if root_translation is not None:
+                frame_buffer["root_translation"].append(root_translation)
             frame_buffer["joint_vel"].append(np.zeros(29, dtype=np.float32))
             frame_buffer["frame_index"].append(np.int64(step))
 
@@ -464,6 +510,15 @@ def run_sender(
                     "smpl_joints": np.stack(frame_buffer["smpl_joints"], axis=0).astype(np.float32),
                     "body_quat_w": np.stack(frame_buffer["body_quat_w"], axis=0).astype(
                         np.float32
+                    ),
+                    **(
+                        {
+                            "root_translation": np.stack(
+                                frame_buffer["root_translation"], axis=0
+                            ).astype(np.float32)
+                        }
+                        if publish_root_translation and len(frame_buffer["root_translation"])
+                        else {}
                     ),
                     "joint_pos": np.stack(frame_buffer["joint_pos"], axis=0).astype(np.float32),
                     "joint_vel": np.stack(frame_buffer["joint_vel"], axis=0).astype(np.float32),
@@ -521,6 +576,21 @@ def main() -> None:
         help="Safety guard: skip samples with too-large per-joint frame jump in meters",
     )
     parser.add_argument(
+        "--no-root-translation",
+        dest="publish_root_translation",
+        action="store_false",
+        help="do not publish root_translation; the packet then carries no absolute "
+        "body position and the bridge reconstructs a standing root instead "
+        "(the operator's steps are lost)",
+    )
+    parser.add_argument(
+        "--standing-pelvis-m",
+        type=float,
+        default=0.975,
+        help="pelvis height in metres used as the zero point of the published "
+        "root translation (default matches the SMPL-X neutral stance)",
+    )
+    parser.add_argument(
         "--start_unpaused",
         action="store_true",
         help="Start streaming immediately instead of the default paused state",
@@ -553,6 +623,8 @@ def main() -> None:
         max_abs_smpl_joint=args.max_abs_smpl_joint,
         max_frame_jump=args.max_frame_jump,
         start_paused=not args.start_unpaused,
+        publish_root_translation=args.publish_root_translation,
+        standing_pelvis_m=args.standing_pelvis_m,
     )
 
 
