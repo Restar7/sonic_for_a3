@@ -214,6 +214,7 @@ uv.lock
 
 # Virtual environments (created by install_scripts/)
 .venv_sim/
+.venv_pico_minimal/
 .venv_teleop/
 .venv_data_collection/
 .venv_camera/
