@@ -128,6 +128,9 @@ bool BuildWholeBodyCommandFromReference(const A3ReferenceWindow& window,
     fields.pelvis_quat_wxyz[i] = static_cast<double>(window.root_quat_wxyz[frame_index * 4 + i]);
   }
   for (int i = 0; i < 3; ++i) {
+    fields.pelvis_position_m[i] = static_cast<double>(window.root_pos_m[frame_index * 3 + i]);
+  }
+  for (int i = 0; i < 3; ++i) {
     fields.waist_angles_rad[i] = policy_q[kPolicyWaistOffset + i];
   }
   for (int i = 0; i < 7; ++i) {

@@ -91,7 +91,9 @@ list(APPEND PROJECT_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/a3_deploy/a3_encoder_decoder_runtime.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/a3_deploy/a3_zmq_smpl_source.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/a3_deploy/a3_reference_stream.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/a3_deploy/a3_teleop_command_source.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/a3_deploy/a3_teleop_command_source.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/a3_deploy/a3_teleop_channel_message.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/a3_deploy/a3_teleop_channel_publisher.cpp)
 list(REMOVE_DUPLICATES PROJECT_SRCS)
 list(REMOVE_ITEM PROJECT_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/g1_deploy_onnx_ref.cpp)
 # a3_deploy/main.cpp is the entry point for the a3_deploy_onnx_ref executable

@@ -143,6 +143,7 @@ int main() {
         "every wire joint index lands on the policy index the official converter reads");
   Check(!rt.has_head, "no head command is claimed (A3_REFERENCE_V1 carries no head)");
   Check(std::fabs(rt.pelvis_quat[0] - 1.0) < 1e-9, "pelvis quaternion is forwarded");
+  Check(std::fabs(fields.pelvis_position_m[2] - 1.07) < 1e-6, "pelvis position is forwarded");
 
   // velocity layout: leg(12) + waist(3) + head(1) + arm(14)
   bool vel_round_trip = true;

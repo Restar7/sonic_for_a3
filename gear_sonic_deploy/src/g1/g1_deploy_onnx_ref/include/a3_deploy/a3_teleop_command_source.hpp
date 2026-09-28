@@ -38,6 +38,7 @@ namespace a3_deploy {
 struct A3WholeBodyCommandFields {
   std::int64_t stamp_ns = 0;
   std::array<double, 4> pelvis_quat_wxyz{1.0, 0.0, 0.0, 0.0};
+  std::array<double, 3> pelvis_position_m{};  // world frame, x-forward y-left z-up
   std::array<double, 12> leg_angles_rad{};   // [0..5] left leg, [6..11] right leg
   std::array<double, 3> waist_angles_rad{};  // yaw, roll, pitch
   std::array<double, 14> arm_angles_rad{};   // [0..6] left arm, [7..13] right arm
