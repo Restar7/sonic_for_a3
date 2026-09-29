@@ -4361,6 +4361,18 @@ class LoopSimRunner:
         self.current_ref_frame += 1
         if self.current_ref_frame < self.reference.num_frames:
             return True
+        # A live stream has no end-of-motion.  The CSV that seeded the sim does,
+        # and the branch below used to wrap it and hard-reset the robot to that
+        # CSV's frame 0 -- so with ``--motion m5_stand.csv`` (249 frames at 50 Hz)
+        # the robot was teleported back to the standing pose every 5.0 seconds for
+        # the whole session.  That is the "it keeps resetting, even when nothing
+        # is wrong" report.  Headless runs never showed it because ``--batch-once``
+        # takes the branch above instead, which is why the acceptance suite was
+        # clean while the viewer session was not.  Hold the CSV where it is and let
+        # StreamingReferenceProvider keep supplying the live window.
+        if getattr(self.config, "reference_source", "csv") == "stream":
+            self.current_ref_frame = self.reference.num_frames - 1
+            return True
         if self.config.batch_once:
             next_idx = self.current_ref_idx + 1
             if next_idx >= len(self.motion_paths):
