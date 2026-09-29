@@ -486,7 +486,16 @@ def run_sender(
             if not ok:
                 frame_buffer.clear()
                 prev_smpl_joints = None
-                root_anchor = None          # re-anchor where the operator stands next
+                # Deliberately keep ``root_anchor``.  Dropping one sample does not
+                # change where the operator started, and the pelvis comes from the
+                # same tracking frame either side of the gap, so the accumulated
+                # travel is still valid.  Resetting it here threw away every metre
+                # walked so far and snapped the reference back to the origin -- the
+                # check fires on a brisk step (``max_frame_jump``), so a walker who
+                # moved quickly was re-anchored over and over and the robot could
+                # only ever mark time in place.  Only an explicit resume (the A
+                # button below) re-anchors, which is the one case where the
+                # operator really is standing somewhere new.
                 skipped += 1
                 now = time.time()
                 if now - last_skip_report >= 1.0:
