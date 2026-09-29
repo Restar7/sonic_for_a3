@@ -98,6 +98,8 @@ NUM_FUTURE_FRAMES = 10
 #: Long enough to settle and to stop a run that cannot hold the pose from
 #: recovering every few steps; short enough that a real fall still triggers.
 FALL_RESET_GRACE_STEPS = 50
+#: How long before --max-policy-steps to warn that the session is ending.
+FINAL_STEPS_WARNING_S = 10.0
 TARGET_FPS = 50.0
 POLICY_DT = 1.0 / TARGET_FPS
 FUTURE_FRAME_SKIP = 5
@@ -2340,7 +2342,10 @@ def build_sim_config(args: argparse.Namespace) -> SimConfig:
         reset_on_fall=bool(getattr(args, "reset_on_fall", False)),
     )
     if config.max_policy_steps is not None and config.max_policy_steps <= 0:
-        raise SystemExit("--max-policy-steps must be positive")
+        # 0 or negative means "no budget": run until the viewer is closed or the
+        # process is interrupted.  A finite default used to cut an interactive
+        # session short mid-teleop, which reads as the program quitting by itself.
+        config.max_policy_steps = None
     if config.action_delay_ms < 0.0:
         raise SystemExit("--action-delay-ms must be non-negative")
     if config.csv_source_fps <= 0.0:
@@ -3868,6 +3873,7 @@ class LoopSimRunner:
         self.playlist_mode = len(motion_paths) > 1
         self.fall_recoveries = 0
         self.fall_grace_until = 0
+        self._stop_warned = False
         self.policy_decimation = max(1, int(round(POLICY_DT / model.opt.timestep)))
         self.action_delay_substeps = int(round(self.config.action_delay_ms / 1000.0 / self.model.opt.timestep))
         self._delay_buf: deque[dict[str, float]] = deque(maxlen=max(1, self.action_delay_substeps + 1))
@@ -4149,6 +4155,22 @@ class LoopSimRunner:
                     break
                 self._prepare_realtime_clock()
 
+            # Tell the operator before the budget runs out.  A run that simply
+            # stops mid-teleop reads as the program quitting on its own -- which is
+            # exactly how "it exited while I was walking backwards" was reported.
+            if (
+                self.config.max_policy_steps is not None
+                and not self._stop_warned
+                and self.config.max_policy_steps - self.current_motion_policy_steps
+                <= int(FINAL_STEPS_WARNING_S / POLICY_DT)
+            ):
+                self._stop_warned = True
+                print(
+                    f"\n[sim] {FINAL_STEPS_WARNING_S:.0f}s of session budget left "
+                    f"({self.config.max_policy_steps} steps total) -- the simulator will "
+                    f"stop on its own.  Raise it with --policy-steps or "
+                    f"run_pico_sim.sh --duration SECONDS."
+                )
             sim_time_before = float(self.data.time)
             step_result = self._step_policy(ref_frame)
             self._record_metrics_step(policy_step, ref_frame, step_result)
