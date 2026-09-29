@@ -433,6 +433,9 @@ def run_sender(
     step = 0
     prev_smpl_joints = None
     root_anchor = None
+    # arm-activity accumulator, see the periodic report
+    prev_arm_pose = None
+    arm_activity = None
     last_skip_report = 0.0
     frame_time = 1.0 / max(1, target_fps)
     paused = bool(start_paused)
@@ -503,6 +506,10 @@ def run_sender(
                     last_skip_report = now
                 continue
             prev_smpl_joints = smpl_joints.copy()
+            if prev_arm_pose is not None:
+                _moved = float(np.max(np.abs(smpl_pose[15:21] - prev_arm_pose[15:21])))
+                arm_activity = _moved if arm_activity is None else max(arm_activity, _moved)
+            prev_arm_pose = smpl_pose.copy()
 
             frame_buffer["smpl_pose"].append(smpl_pose)
             frame_buffer["smpl_joints"].append(smpl_joints)
@@ -543,10 +550,29 @@ def run_sender(
             now = time.time()
             if now - last_report >= report_interval:
                 fps = sent / max(now - last_report, 1e-6)
+                # Controller/hand tracking state alongside the frame rate.  "The
+                # arms went forward and stopped" is the signature of a controller
+                # that dropped out: the SDK keeps reporting body joints but the
+                # hands revert to a default pose, so the retarget faithfully
+                # reproduces a frozen arm and the cost stays LOW -- which reads as
+                # a pipeline fault when it is an input fault.  These two flags make
+                # that distinction visible in the log.
+                # How much the arms actually moved during this interval, in radians
+                # of body-joint rotation.  A frozen arm shows up here as ~0.000
+                # while the feed keeps running, and the retarget then reproduces it
+                # faithfully with a *low* cost -- which reads as a pipeline fault
+                # when it is the input.  ``smpl_pose[15:21]`` is the six
+                # shoulder/elbow/wrist joints.
+                arm_note = ""
+                if arm_activity is not None:
+                    arm_note = f", arm_move={arm_activity:.3f}"
+                    if arm_activity < 0.01:
+                        arm_note += " <-- arms FROZEN (controller/tracking, not the pipeline)"
                 print(
                     f"[minimal] sent_fps={fps:.2f}, step={step}, window={num_frames_to_send}, "
-                    f"skipped={skipped}, state={'PAUSED' if paused else 'RUNNING'}"
+                    f"skipped={skipped}, state={'PAUSED' if paused else 'RUNNING'}{arm_note}"
                 )
+                arm_activity = None
                 sent = 0
                 skipped = 0
                 last_report = now
