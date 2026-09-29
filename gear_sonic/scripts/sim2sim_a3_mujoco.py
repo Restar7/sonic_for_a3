@@ -94,6 +94,10 @@ PASSIVE_FOOT_JOINT_NAMES = (
 
 NUM_POLICY_DOFS = 29
 NUM_FUTURE_FRAMES = 10
+#: Steps to leave the fall check disarmed after standing the robot back up.
+#: Long enough to settle and to stop a run that cannot hold the pose from
+#: recovering every few steps; short enough that a real fall still triggers.
+FALL_RESET_GRACE_STEPS = 50
 TARGET_FPS = 50.0
 POLICY_DT = 1.0 / TARGET_FPS
 FUTURE_FRAME_SKIP = 5
@@ -270,6 +274,7 @@ class SimConfig:
     reference_startup_wait_s: float = 30.0
     reference_endpoint: str = "tcp://127.0.0.1:5560"
     realtime: bool = False
+    reset_on_fall: bool = False
 
 
 # =============================================================================
@@ -2332,6 +2337,7 @@ def build_sim_config(args: argparse.Namespace) -> SimConfig:
         reference_startup_wait_s=float(args.reference_startup_wait_s),
         reference_endpoint=str(args.reference_endpoint),
         realtime=bool(args.realtime),
+        reset_on_fall=bool(getattr(args, "reset_on_fall", False)),
     )
     if config.max_policy_steps is not None and config.max_policy_steps <= 0:
         raise SystemExit("--max-policy-steps must be positive")
@@ -3860,6 +3866,8 @@ class LoopSimRunner:
             raise ValueError(f"INIT_FRAME must be in [0, {self.reference.num_frames - 1}], got {self.init_frame}")
 
         self.playlist_mode = len(motion_paths) > 1
+        self.fall_recoveries = 0
+        self.fall_grace_until = 0
         self.policy_decimation = max(1, int(round(POLICY_DT / model.opt.timestep)))
         self.action_delay_substeps = int(round(self.config.action_delay_ms / 1000.0 / self.model.opt.timestep))
         self._delay_buf: deque[dict[str, float]] = deque(maxlen=max(1, self.action_delay_substeps + 1))
@@ -4144,6 +4152,23 @@ class LoopSimRunner:
             sim_time_before = float(self.data.time)
             step_result = self._step_policy(ref_frame)
             self._record_metrics_step(policy_step, ref_frame, step_result)
+            if self.config.reset_on_fall:
+                # Grace period: right after standing the robot up it needs a moment
+                # to settle, and the pose it was placed in may itself sit near a
+                # threshold.  Without this a run that cannot hold the pose recovers
+                # every few steps and floods the log (measured: 409 recoveries in
+                # 2500 steps before this existed).
+                if policy_step < self.fall_grace_until:
+                    pass
+                else:
+                    _reason = self._fall_reason()
+                    if _reason is not None:
+                        self._recover_from_fall(_reason)
+                        self.fall_grace_until = policy_step + FALL_RESET_GRACE_STEPS
+                        print(
+                            f"\n[fall] recovered #{self.fall_recoveries} at step {policy_step} "
+                            f"({_reason}) -- stood back up on the current reference pose"
+                        )
             self.current_motion_policy_steps += 1
             self._update_progress_detail(policy_step, ref_frame, step_result.raw_action_il)
             self._write_video_frame(ref_frame)
@@ -4248,6 +4273,70 @@ class LoopSimRunner:
             q_des_il=target_il.copy(),
             actor_obs=actor_obs.copy(),
         )
+
+    def _fall_reason(self) -> str | None:
+        """Same heuristic the metrics report uses, evaluated on the live state."""
+        root_height = float(self.data.qpos[2]) if self.data.qpos.shape[0] >= 3 else None
+        if root_height is not None and root_height < 0.45:
+            return f"root height {root_height:.3f} m < 0.45"
+        try:
+            rpy = root_roll_pitch_deg_from_quat_wxyz(get_root_quat(self.data))
+        except Exception:
+            rpy = (None, None)
+        for label, value in zip(("roll", "pitch"), rpy):
+            if value is not None and abs(value) > 60.0:
+                return f"{label} {value:+.1f} deg > 60"
+        return None
+
+    def _recover_from_fall(self, reason: str) -> None:
+        """Stand the robot back up on the reference's *current* pose.
+
+        The old behaviour was to leave it on the floor for the rest of the
+        session, which makes a viewer session useless after the first fall.  The
+        pose comes from the live window when a stream is driving (root position,
+        anchor orientation and the 29 joint positions); ``fill_loop_qpos_motors``
+        turns those into a configuration the closed ankle/waist loops actually
+        satisfy, so the robot is placed somewhere physically reachable rather than
+        at raw joint values that violate the constraints.
+        """
+        qpos = np.array(self.reference.qpos[0], dtype=np.float64, copy=True)
+        window = None
+        provider = getattr(self, "reference_provider", None)
+        current = getattr(provider, "_current", None)
+        if current is not None and getattr(current, "valid", False):
+            window = current
+        if window is not None:
+            try:
+                dof = np.asarray(window.dof_il[0], dtype=np.float64)
+                fill_loop_qpos_motors(qpos, self.runtime, self.solver, dof)
+                # root_pos_m / anchor_quat_wxyz are the whole [F, ...] window, not
+                # a single frame -- take frame 0, which is the oldest sample the
+                # encoder window is built around.
+                root = getattr(window, "root_pos_m", None)
+                if root is not None:
+                    root = np.asarray(root, dtype=np.float64)
+                    qpos[:3] = root.reshape(-1, 3)[0]
+                quat = np.asarray(window.anchor_quat_wxyz, dtype=np.float64)
+                quat = quat.reshape(-1, 4)[0]
+                norm = float(np.linalg.norm(quat))
+                if norm > 1e-6:
+                    qpos[3:7] = quat / norm
+            except Exception as exc:  # pragma: no cover - defensive
+                print(f"[fall] live pose unavailable ({exc}); standing up at the seeding clip")
+                qpos = np.array(self.reference.qpos[0], dtype=np.float64, copy=True)
+        self.data.qpos[:] = qpos
+        self.data.qvel[:] = 0.0
+        self.data.ctrl[:] = 0.0
+        set_loop_heads_zero(self.data, self.runtime)
+        mujoco.mj_forward(self.model, self.data)
+        self.last_action_il = np.zeros(NUM_POLICY_DOFS, dtype=np.float64)
+        self._reset_action_delay_buffer()
+        self.history = prime_history(
+            build_loop_current_obs_terms(
+                self.model, self.data, self.runtime, self.solver, self.last_action_il
+            )
+        )
+        self.fall_recoveries += 1
 
     def _record_metrics_step(
         self,
@@ -4695,6 +4784,16 @@ def parse_args() -> argparse.Namespace:
         "--future-zero-pad",
         action="store_true",
         help="Zero encoder slots after --future-valid-frames instead of repeating the last sample.",
+    )
+    parser.add_argument(
+        "--reset-on-fall",
+        action="store_true",
+        help=(
+            "Stand the robot back up on the live reference pose whenever the fall "
+            "heuristic trips, instead of leaving it on the floor for the rest of the "
+            "session.  Off for batch/acceptance runs (they score the fall and must "
+            "not recover from it); run_live_chain.py turns it on for viewer sessions."
+        ),
     )
     parser.add_argument(
         "--batch-once",
